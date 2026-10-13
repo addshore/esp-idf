@@ -35,7 +35,7 @@ extern void esp_startup_start_app(void);
 
 // Entry point for core 0 from hardware init (port layer)
 #if defined(__APPLE__) && defined(__MACH__)
-static void start_cpu0_default(void);
+void start_cpu0_default(void);
 __attribute__((weak, noreturn)) void start_cpu0(void)
 {
     start_cpu0_default();
@@ -197,7 +197,7 @@ static void do_secondary_init(void)
 #endif
 }
 
-static void start_cpu0_default(void)
+void start_cpu0_default(void)
 {
     // Initialize core components and services.
     // Operations that needs the cache to be disabled have to be done here.

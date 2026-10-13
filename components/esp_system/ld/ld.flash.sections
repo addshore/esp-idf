@@ -245,6 +245,9 @@
      * driver to maintain the virtual address.
      * NOLOAD rodata may not be included in this section.
      */
+#ifdef CONFIG_RODATA_PADDING
+    . += CONFIG_RODATA_PADDING;
+#endif
     _rodata_reserved_end = .;
 
     SECTION_MAPPINGS(rodata_noload)

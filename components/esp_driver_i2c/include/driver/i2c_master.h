@@ -289,7 +289,8 @@ esp_err_t i2c_master_execute_defined_operations(i2c_master_dev_handle_t i2c_dev,
  * @note User can deregister a previously registered callback by calling this function and setting the callback member in the `cbs` structure to NULL.
  * @note When CONFIG_I2C_ISR_IRAM_SAFE is enabled, the callback itself and functions called by it should be placed in IRAM.
  *       The variables used in the function should be in the SRAM as well. The `user_data` should also reside in SRAM.
- * @note If the callback is used for helping asynchronous transaction. On the same bus, only one device can be used for performing asynchronous operation.
+ * @note When callbacks are used for asynchronous transactions, multiple devices may share the same bus. Transactions are
+ *       serialized by the bus queue, and each completion callback is invoked for the device that submitted the transaction.
  *
  * @param[in] i2c_dev I2C master device handle that created by `i2c_master_bus_add_device`.
  * @param[in] cbs Group of callback functions
@@ -334,6 +335,25 @@ esp_err_t i2c_master_bus_reset(i2c_master_bus_handle_t bus_handle);
  *      - Ensure that the new address is valid and does not conflict with other devices on the bus.
  */
 esp_err_t i2c_master_device_change_address(i2c_master_dev_handle_t i2c_dev, uint16_t new_device_address, int timeout_ms);
+
+/**
+ * @brief Abort the active asynchronous transaction on an I2C master bus.
+ *
+ * This function synchronizes with the I2C interrupt handler before returning.
+ * After it returns, the driver no longer accesses the aborted transaction's
+ * operation descriptors or data buffers. The bus must not have queued
+ * transactions.
+ *
+ * @param[in] bus_handle I2C bus handle.
+ * @return
+ *      - ESP_OK: The transaction was aborted and the controller state was
+ *        reset. Call i2c_master_bus_reset to perform physical bus recovery if
+ *        a target continues to hold a line low.
+ *      - ESP_ERR_INVALID_ARG: The bus handle is invalid.
+ *      - ESP_ERR_INVALID_STATE: The bus is not asynchronous, has no active
+ *        transaction, or has queued transactions.
+ */
+esp_err_t i2c_master_bus_abort_transaction(i2c_master_bus_handle_t bus_handle);
 
 /**
  * @brief Wait for all pending I2C transactions done

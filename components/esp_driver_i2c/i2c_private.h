@@ -33,8 +33,10 @@ extern "C" {
 
 #if CONFIG_I2C_ISR_IRAM_SAFE
 #define I2C_MEM_ALLOC_CAPS    (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)
+#define I2C_SLAVE_ISR_ATTR    IRAM_ATTR
 #else
 #define I2C_MEM_ALLOC_CAPS     (MALLOC_CAP_DEFAULT)
+#define I2C_SLAVE_ISR_ATTR
 #endif
 
 // I2C driver object is per-mode, the interrupt source is shared between modes
@@ -82,9 +84,15 @@ typedef struct {
 } i2c_operation_t;
 
 typedef struct {
+    i2c_master_dev_t *device; // Device used for this transaction
     uint32_t device_address; // Address of I2C device
+    uint32_t scl_speed_hz; // SCL clock frequency for this transaction
+    uint32_t scl_wait_us; // SCL stretch timeout for this transaction
     i2c_operation_t *ops; // Pointer to I2C operation structure
     size_t cmd_count; // Record how many I2C hardware commands in one transaction
+    i2c_addr_bit_len_t addr_10bits; // Whether the device address is 10 bits
+    bool ack_check_disable; // Whether ACK checking is disabled for this transaction
+    bool is_probe; // Whether this is a synchronous probe on an asynchronous bus
 } i2c_transaction_t;
 
 struct i2c_bus_t {
@@ -114,6 +122,7 @@ typedef struct i2c_master_device_list {
 
 struct i2c_master_bus_t {
     i2c_bus_t *base;                                                 // bus base class
+    portMUX_TYPE transaction_lock;                                   // Serializes abort with ISR transaction access
     SemaphoreHandle_t bus_lock_mux;                                  // semaphore to lock bus process
     int cmd_idx;                                                     //record current command index, for master mode
     _Atomic i2c_master_status_t status;                              // record current command status, for master mode
@@ -130,6 +139,10 @@ struct i2c_master_bus_t {
     uint32_t w_r_size;                                               // The size send/receive last time.
     bool trans_over_buffer;                                          // Data length is more than hardware fifo length, needs interrupt.
     bool async_trans;                                                // asynchronous transaction, true after callback is installed.
+    bool transaction_active;                                         // protected by transaction_lock
+    _Atomic bool abort_requested;                                    // asks the ISR to yield ownership to abort
+    i2c_master_event_t async_error_event;                            // error retained until the asynchronous transaction is terminal
+    bool async_stopping_after_nack;                                  // standalone STOP is active after an asynchronous NACK
     bool ack_check_disable;                                          // Disable ACK check
     volatile bool trans_done;                                        // transaction command finish
     bool bypass_nack_log;                                             // Bypass the error log. Sometimes the error is expected.
@@ -175,16 +188,33 @@ typedef struct {
     uint32_t rcv_fifo_cnt;      // receive fifo count.
 } i2c_slave_receive_t;
 
+typedef struct {
+    uint8_t data[2][I2C_LL_GET(FIFO_LEN)];
+    uint8_t length[2];
+    uint8_t active;
+    bool pending;
+    bool loaded;
+    bool enabled;
+} i2c_slave_default_response_t;
+
 struct i2c_slave_dev_t {
     i2c_bus_t *base;                                  // bus base class
-    SemaphoreHandle_t operation_mux;                  // Mux for i2c slave operation
+    SemaphoreHandle_t operation_mux;                  // Mux for i2c slave task writers
     i2c_slave_request_callback_t request_callback;    // i2c slave request callback
     i2c_slave_received_callback_t receive_callback;   // i2c_slave receive callback
+    i2c_slave_transmit_callback_t transmit_callback;  // synchronously provide transmit data from the ISR
+    i2c_slave_transmit_done_callback_t transmit_done_callback; // synchronously provided transmit data completed
     void *user_ctx;                                   // Callback user context
     RingbufHandle_t rx_ring_buf;                      // receive ringbuffer
     RingbufHandle_t tx_ring_buf;                      // transmit ringbuffer
     uint32_t rx_data_count;                           // receive data count
+    uint32_t tx_data_count;                           // callback-provided bytes loaded for the current transaction
     i2c_slave_receive_t receive_desc;                 // slave receive descriptor
+    i2c_slave_default_response_t *default_response;   // fallback response used while the transmit stream is empty
+    bool receive_overflow;                            // bytes were dropped in the current receive transaction
+    bool request_pending;                             // target is stretching while waiting for transmit data
+    bool transmit_active;                             // controller is reading from the target
+    bool buffered_write_pending;                      // application will continue a partially buffered response
 };
 
 /**

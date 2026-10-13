@@ -70,7 +70,7 @@ typedef struct {
     spi_clock_source_t clock_source;///< Select SPI clock source, `SPI_CLK_SRC_DEFAULT` by default.
     uint16_t duty_cycle_pos;        ///< Duty cycle of positive clock, in 1/256th increments (128 = 50%/50% duty). Setting this to 0 (=not setting it) is equivalent to setting this to 128.
     uint16_t cs_ena_pretrans;       ///< Amount of SPI bit-cycles the cs should be activated before the transmission (0-16). This only works on half-duplex transactions.
-    uint8_t cs_ena_posttrans;       ///< Amount of SPI bit-cycles the cs should stay active after the transmission (0-16)
+    uint8_t cs_ena_posttrans;       ///< Amount of SPI bit-cycles the cs should stay active after the transmission (0-16, 0-15 on ESP32)
     int clock_speed_hz;             ///< SPI clock speed in Hz. Derived from `clock_source`.
     int input_delay_ns;             /**< Maximum data valid time of slave. The time required between SCLK and MISO
         valid, including the possible clock delay from slave to master. The driver uses this value to give an extra
@@ -342,6 +342,21 @@ esp_err_t spi_device_polling_transmit(spi_device_handle_t handle, spi_transactio
  *      - ESP_OK : Success.
  */
 esp_err_t spi_device_acquire_bus(spi_device_handle_t device, uint32_t wait);
+
+/**
+ * @brief Try to occupy the SPI bus for a device without waiting.
+ *
+ * On success this has the same effect as `spi_device_acquire_bus`. The caller
+ * must eventually call `spi_device_release_bus`.
+ *
+ * @param device The device requesting exclusive use of the bus.
+ *
+ * @return
+ *      - ESP_ERR_TIMEOUT : The bus is currently in use
+ *      - ESP_ERR_INVALID_STATE : A polling transaction is in progress
+ *      - ESP_OK : Success
+ */
+esp_err_t spi_device_try_acquire_bus(spi_device_handle_t device);
 
 /**
  * @brief Release the SPI bus occupied by the device. All other devices can start sending transactions.
