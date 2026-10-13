@@ -16,6 +16,10 @@ if(CONFIG_SOC_ADC_SUPPORTED)
         "adc_cali_curve_fitting.c"
     )
 
+    if(${target} STREQUAL "esp32s31")
+        list(APPEND srcs "esp32s31/adc_cali_s31.c")
+    endif()
+
     if(CONFIG_SOC_ADC_DMA_SUPPORTED)
         list(APPEND srcs "adc_continuous.c")
         if(CONFIG_SOC_ADC_MONITOR_SUPPORTED)

@@ -108,6 +108,7 @@ typedef bool (*i2c_master_callback_t)(i2c_master_dev_handle_t i2c_dev, const i2c
 typedef struct {
     uint8_t *buffer;  /**< Pointer for buffer received in callback. */
     uint32_t length;      /**< Length for buffer received in callback. */
+    bool overflow;        /**< Whether bytes were discarded because the receive buffer was full. */
 } i2c_slave_rx_done_event_data_t;
 
 /**
@@ -161,6 +162,37 @@ typedef struct {
  * @return Whether a high priority task has been waken up by this function
  */
 typedef bool (*i2c_slave_request_callback_t)(i2c_slave_dev_handle_t i2c_slave, const i2c_slave_request_event_data_t *evt_data, void *arg);
+
+/**
+ * @brief Event structure used to synchronously provide target transmit data.
+ */
+typedef struct {
+    const uint8_t *buffer; /**< Internal-memory buffer supplied by the callback. */
+    uint32_t buffer_size;  /**< Maximum number of bytes requested. */
+    uint32_t length;       /**< Number of bytes supplied by the callback. */
+} i2c_slave_transmit_event_data_t;
+
+/**
+ * @brief ISR callback for synchronously providing data requested by a controller.
+ *
+ * The callback must set `buffer` to data in internal memory that remains valid
+ * until the transaction completes, and set `length` to at most `buffer_size`.
+ * It can be called repeatedly during one transaction. Registering this callback
+ * makes `i2c_slave_write` unavailable.
+ */
+typedef bool (*i2c_slave_transmit_callback_t)(i2c_slave_dev_handle_t i2c_slave, i2c_slave_transmit_event_data_t *evt_data, void *arg);
+
+/**
+ * @brief Event structure used when a controller read transaction completes.
+ */
+typedef struct {
+    uint32_t length;  /**< Number of callback-provided bytes clocked by the controller. */
+} i2c_slave_transmit_done_event_data_t;
+
+/**
+ * @brief ISR callback for completion of a controller read transaction.
+ */
+typedef bool (*i2c_slave_transmit_done_callback_t)(i2c_slave_dev_handle_t i2c_slave, const i2c_slave_transmit_done_event_data_t *evt_data, void *arg);
 
 #ifdef __cplusplus
 }

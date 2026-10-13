@@ -27,6 +27,7 @@
 #include "sdkconfig.h"
 
 #include "driver/gpio.h"
+#include "esp_private/gpio.h"
 #include "driver/spi_slave.h"
 #include "hal/gpio_hal.h"
 #include "hal/spi_slave_hal.h"
@@ -75,6 +76,13 @@ typedef struct {
     QueueHandle_t ret_queue;
     bool cs_iomux;
     uint8_t cs_in_signal;
+    portMUX_TYPE transaction_lock;
+    const spi_slave_transaction_t * volatile abort_trans_desc;
+#if CONFIG_IDF_TARGET_ESP32
+    volatile bool abort_dma_reset_done;
+    volatile bool transaction_dma_reset_pending;
+    volatile bool transaction_dma_reset_done;
+#endif
 #ifdef CONFIG_PM_ENABLE
     esp_pm_lock_handle_t pm_lock;
 #endif
@@ -114,6 +122,12 @@ static inline void SPI_SLAVE_ISR_ATTR freeze_cs(spi_slave_t *host)
 // This is used in test by internal gpio matrix connections
 static inline void SPI_SLAVE_ISR_ATTR restore_cs(spi_slave_t *host)
 {
+    // A negative CS pin is supported for non-DMA targets whose selection is
+    // handled outside the driver. In that configuration there is no GPIO
+    // route to restore.
+    if (host->cfg.spics_io_num < 0) {
+        return;
+    }
 #if SPI_LL_SLAVE_NEEDS_CS_WORKAROUND
     // This workaround only for ESP32 due to old hardware design, see MR !3207
     if (host->cs_iomux) {
@@ -175,9 +189,10 @@ esp_err_t spi_slave_initialize(spi_host_device_t host, const spi_bus_config_t *b
     // spi_slave_t contains atomic variable, memory must be allocated from internal memory
     spihost[host] = heap_caps_calloc(1, sizeof(spi_slave_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (spihost[host] == NULL) {
-        ret = ESP_ERR_NO_MEM;
-        goto cleanup;
+        spicommon_periph_free(host);
+        return ESP_ERR_NO_MEM;
     }
+    spihost[host]->transaction_lock = (portMUX_TYPE)portMUX_INITIALIZER_UNLOCKED;
     memcpy(&spihost[host]->cfg, slave_config, sizeof(spi_slave_interface_config_t));
     spihost[host]->id = host;
     spihost[host]->bus_attr = (spi_bus_attr_t *)spi_bus_get_attr(host);
@@ -307,10 +322,30 @@ esp_err_t spi_slave_initialize(spi_host_device_t host, const spi_bus_config_t *b
     };
     spi_slave_hal_init(hal, &hal_config);
 
+#if CONFIG_IDF_TARGET_ESP32
+    // On the classic ESP32, the LL read/write names describe the peripheral
+    // data registers. They are opposite to the target-facing RX/TX directions.
+    hal->rx_lsbfirst = (slave_config->flags & SPI_SLAVE_TXBIT_LSBFIRST) ? 1 : 0;
+    hal->tx_lsbfirst = (slave_config->flags & SPI_SLAVE_RXBIT_LSBFIRST) ? 1 : 0;
+#else
     hal->rx_lsbfirst = (slave_config->flags & SPI_SLAVE_RXBIT_LSBFIRST) ? 1 : 0;
     hal->tx_lsbfirst = (slave_config->flags & SPI_SLAVE_TXBIT_LSBFIRST) ? 1 : 0;
+#endif
     hal->mode = slave_config->mode;
     hal->use_dma = spihost[host]->bus_attr->dma_enabled;
+#if CONFIG_IDF_TARGET_ESP32S3
+    if (hal->mode & 2) {
+        // Implement CPOL=1 using CPOL=0 and an inverted input clock. The
+        // native mode-2 DMA path launches MISO on the controller's sampling
+        // edge, too late for controllers that sample without an input delay.
+        // Apply the same mapping to mode 3 and non-DMA transfers so changing
+        // modes does not leave the first output bit on the wrong edge.
+        gpio_func_sel(bus_config->sclk_io_num, PIN_FUNC_GPIO);
+        esp_rom_gpio_connect_in_signal(bus_config->sclk_io_num,
+                                       spi_periph_signal[host].spiclk_in, true);
+        hal->mode &= 1;
+    }
+#endif
     spi_slave_hal_setup_device(hal);
     return ESP_OK;
 
@@ -323,6 +358,21 @@ esp_err_t spi_slave_free(spi_host_device_t host)
 {
     SPI_CHECK(is_valid_host(host), "invalid host", ESP_ERR_INVALID_ARG);
     SPI_CHECK(spihost[host], "host not slave", ESP_ERR_INVALID_ARG);
+    spi_slave_t *slave = spihost[host];
+    portENTER_CRITICAL(&slave->transaction_lock);
+    bool transaction_pending = slave->cur_trans.trans != NULL ||
+                               slave->abort_trans_desc != NULL ||
+                               (slave->trans_queue && uxQueueMessagesWaiting(slave->trans_queue) != 0);
+    if (transaction_pending) {
+        portEXIT_CRITICAL(&slave->transaction_lock);
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (slave->intr) {
+        // Keep the ISR from mounting a transaction while the driver-owned
+        // queues and state are being released.
+        esp_intr_disable(slave->intr);
+    }
+    portEXIT_CRITICAL(&slave->transaction_lock);
     if (spihost[host]->trans_queue) {
         vQueueDelete(spihost[host]->trans_queue);
     }
@@ -336,6 +386,13 @@ esp_err_t spi_slave_free(spi_host_device_t host)
     if (spihost[host]->cfg.spics_io_num >= 0) {
         spicommon_cs_free_io(spihost[host]->cfg.spics_io_num, &spihost[host]->bus_attr->gpio_reserve);
     }
+#if CONFIG_IDF_TARGET_ESP32S3
+    if (spihost[host]->cfg.mode & 2) {
+        // Clear inversion before a later user routes this clock via IO_MUX.
+        esp_rom_gpio_connect_in_signal(GPIO_MATRIX_CONST_ZERO_INPUT,
+                                       spi_periph_signal[host].spiclk_in, false);
+    }
+#endif
     esp_intr_free(spihost[host]->intr);
 
 #if SOC_SPI_SUPPORT_SLEEP_RETENTION && CONFIG_PM_POWER_DOWN_PERIPHERAL_IN_LIGHT_SLEEP
@@ -496,8 +553,49 @@ esp_err_t SPI_SLAVE_ATTR spi_slave_queue_reset(spi_host_device_t host)
         spi_slave_uninstall_priv_trans(host, &trans);
     }
     spihost[host]->cur_trans.trans = NULL;
+    spihost[host]->abort_trans_desc = NULL;
+#if CONFIG_IDF_TARGET_ESP32
+    spihost[host]->transaction_dma_reset_pending = false;
+    spihost[host]->transaction_dma_reset_done = false;
+#endif
 
     return ESP_OK;
+}
+
+esp_err_t SPI_SLAVE_ATTR spi_slave_abort_transaction(spi_host_device_t host, const spi_slave_transaction_t *trans_desc)
+{
+    SPI_CHECK(is_valid_host(host), "invalid host", ESP_ERR_INVALID_ARG);
+    SPI_CHECK(spihost[host], "host not slave", ESP_ERR_INVALID_ARG);
+    SPI_CHECK(trans_desc, "invalid transaction", ESP_ERR_INVALID_ARG);
+
+    spi_slave_t *slave = spihost[host];
+    SPI_CHECK(slave->cfg.spics_io_num >= 0, "abort requires a CS pin", ESP_ERR_NOT_SUPPORTED);
+
+    // Stop accepting clocks first. The ISR remains the sole owner that retires
+    // mounted transactions. The lock serializes this request with an ISR that
+    // may already be completing the transaction on the other core.
+    esp_err_t ret = ESP_OK;
+    portENTER_CRITICAL(&slave->transaction_lock);
+    if (slave->cur_trans.trans != trans_desc) {
+        ret = ESP_ERR_INVALID_STATE;
+    } else {
+        freeze_cs(slave);
+        esp_intr_disable(slave->intr);
+        // The ISR retires the descriptor and reports completion only after the
+        // peripheral and any DMA channel have been reset.
+        slave->abort_trans_desc = trans_desc;
+#if CONFIG_IDF_TARGET_ESP32
+        bool dma_reset_pending = slave->transaction_dma_reset_pending;
+#else
+        bool dma_reset_pending = false;
+#endif
+        if (!dma_reset_pending) {
+            spi_ll_set_int_stat(slave->hal.hw);
+            esp_intr_enable(slave->intr);
+        }
+    }
+    portEXIT_CRITICAL(&slave->transaction_lock);
+    return ret;
 }
 
 esp_err_t SPI_SLAVE_ISR_ATTR spi_slave_queue_trans_isr(spi_host_device_t host, const spi_slave_transaction_t *trans_desc)
@@ -554,6 +652,11 @@ esp_err_t SPI_SLAVE_ISR_ATTR spi_slave_queue_reset_isr(spi_host_device_t host)
     ESP_RETURN_ON_ERROR_ISR(err, SPI_TAG, "can't reset queue");
 
     spihost[host]->cur_trans.trans = NULL;
+    spihost[host]->abort_trans_desc = NULL;
+#if CONFIG_IDF_TARGET_ESP32
+    spihost[host]->transaction_dma_reset_pending = false;
+    spihost[host]->transaction_dma_reset_done = false;
+#endif
     return ESP_OK;
 }
 
@@ -631,8 +734,13 @@ static void SPI_SLAVE_ISR_ATTR s_spi_slave_prepare_data(spi_slave_t *host)
     spi_slave_hal_set_trans_bitlen(hal);
 
 #ifdef CONFIG_IDF_TARGET_ESP32
-    //SPI Slave mode on ESP32 requires MOSI/MISO enable
+    // SPI Slave mode on ESP32 requires MOSI/MISO enable.
     spi_slave_hal_enable_data_line(hal);
+#endif
+#ifdef CONFIG_IDF_TARGET_ESP32S3
+    bool receive_enabled = host->bus_config.mosi_io_num >= 0;
+    bool transmit_enabled = host->bus_config.miso_io_num >= 0;
+    spi_slave_hal_select_data_line_edges(hal, receive_enabled, transmit_enabled);
 #endif
 }
 
@@ -640,6 +748,17 @@ static void SPI_SLAVE_ISR_ATTR s_spi_slave_prepare_data(spi_slave_t *host)
 static void SPI_SLAVE_ISR_ATTR spi_slave_restart_after_dmareset(void *arg)
 {
     spi_slave_t *host = (spi_slave_t *)arg;
+    host->transaction_dma_reset_pending = false;
+    host->transaction_dma_reset_done = true;
+    spi_ll_set_int_stat(host->hal.hw);
+    esp_intr_enable(host->intr);
+}
+
+static void SPI_SLAVE_ISR_ATTR spi_slave_abort_after_dmareset(void *arg)
+{
+    spi_slave_t *host = (spi_slave_t *)arg;
+    host->abort_dma_reset_done = true;
+    spi_ll_set_int_stat(host->hal.hw);
     esp_intr_enable(host->intr);
 }
 #endif  //#if CONFIG_IDF_TARGET_ESP32
@@ -668,27 +787,118 @@ static void SPI_SLAVE_ISR_ATTR spi_intr(void *arg)
     spi_slave_t *host = (spi_slave_t *)arg;
     spi_slave_hal_context_t *hal = &host->hal;
 
-    assert(spi_slave_hal_usr_is_done(hal));
+    portENTER_CRITICAL_ISR(&host->transaction_lock);
 
     bool use_dma = host->bus_attr->dma_enabled;
-    if (host->cur_trans.trans) {
-        // When DMA is enabled, the slave rx dma suffers from unexpected transactions. Forbid reading until transaction ready.
-        if (use_dma) {
-            freeze_cs(host);
-            spicommon_dma_rx_mb(host->id, host->cur_trans.rx_buffer);
-            spi_slave_trans_dma_error_check(host);
+    const spi_slave_transaction_t *abort_trans_desc = host->abort_trans_desc;
+    if (abort_trans_desc) {
+        if (host->cur_trans.trans != abort_trans_desc) {
+            // Natural completion won the race and may already have mounted a
+            // queued transaction. Do not disturb it, but reconnect its CS.
+            host->abort_trans_desc = NULL;
+            restore_cs(host);
+            goto isr_exit;
         }
-
-        spi_slave_hal_store_result(hal);
-        host->cur_trans.trans->trans_len = spi_slave_hal_get_rcv_bitlen(hal);
 
 #if CONFIG_IDF_TARGET_ESP32
-        //This workaround is only for esp32
-        if (spi_slave_hal_dma_need_reset(hal)) {
-            //On ESP32, actual_tx_dma_chan and actual_rx_dma_chan are always same
-            spicommon_dmaworkaround_req_reset(host->dma_ctx->tx_dma_chan.chan_id, spi_slave_restart_after_dmareset, host);
+        host->transaction_dma_reset_pending = false;
+        host->transaction_dma_reset_done = false;
+        if (use_dma) {
+            if (!host->abort_dma_reset_done) {
+                bool reset_done = spicommon_dmaworkaround_req_reset(
+                                      host->dma_ctx->tx_dma_chan.chan_id,
+                                      spi_slave_abort_after_dmareset,
+                                      host);
+                spicommon_dmaworkaround_idle(host->dma_ctx->tx_dma_chan.chan_id);
+                if (!reset_done) {
+                    esp_intr_disable(host->intr);
+                    goto isr_exit;
+                }
+            }
+            host->abort_dma_reset_done = false;
         }
+#elif SOC_GDMA_SUPPORTED
+        if (use_dma) {
+            (void) gdma_reset(host->dma_ctx->rx_dma_chan);
+            (void) gdma_reset(host->dma_ctx->tx_dma_chan);
+        }
+#else
+        if (use_dma) {
+            spi_dma_reset(host->dma_ctx->rx_dma_chan);
+            spi_dma_reset(host->dma_ctx->tx_dma_chan);
+        }
+#endif
+        // Stop the SPI peripheral only after DMA is idle. This matches the
+        // natural short-transaction path and avoids resetting the peripheral
+        // while its DMA channel still owns descriptors.
+        spi_slave_hal_hw_reset(hal);
+        host->cur_trans.trans->trans_len = 0;
+        hal->rx_buffer = NULL;
+        hal->tx_buffer = NULL;
+        if (host->cfg.post_trans_cb) {
+            host->cfg.post_trans_cb(host->cur_trans.trans);
+        }
+        if (!(host->cfg.flags & SPI_SLAVE_NO_RETURN_RESULT)) {
+            xQueueSendFromISR(host->ret_queue, &host->cur_trans, &do_yield);
+        }
+        host->cur_trans.trans = NULL;
+        host->abort_trans_desc = NULL;
+        goto dispatch_next;
+    }
+
+    bool transaction_dma_reset_done = false;
+#if CONFIG_IDF_TARGET_ESP32
+    transaction_dma_reset_done = host->transaction_dma_reset_done;
+    host->transaction_dma_reset_done = false;
+#endif
+    assert(spi_slave_hal_usr_is_done(hal));
+
+    if (host->cur_trans.trans) {
+        if (!transaction_dma_reset_done) {
+            // When DMA is enabled, the slave rx dma suffers from unexpected transactions. Forbid reading until transaction ready.
+            if (use_dma) {
+                freeze_cs(host);
+            }
+
+            if (use_dma) {
+                spicommon_dma_rx_mb(host->id, host->cur_trans.rx_buffer);
+                spi_slave_trans_dma_error_check(host);
+            }
+            spi_slave_hal_store_result(hal);
+            host->cur_trans.trans->trans_len = spi_slave_hal_get_rcv_bitlen(hal);
+
+#if CONFIG_IDF_TARGET_ESP32
+            // This workaround is only for ESP32. Do not return the descriptor
+            // while a shared DMA reset is pending: the DMA engine may still
+            // own and write the receive buffer.
+            if (spi_slave_hal_dma_need_reset(hal)) {
+                // On ESP32, actual_tx_dma_chan and actual_rx_dma_chan are always same.
+                bool reset_done = spicommon_dmaworkaround_req_reset(
+                                      host->dma_ctx->tx_dma_chan.chan_id,
+                                      spi_slave_restart_after_dmareset,
+                                      host);
+                if (!reset_done) {
+                    host->transaction_dma_reset_pending = true;
+                    spicommon_dmaworkaround_idle(host->dma_ctx->tx_dma_chan.chan_id);
+                    esp_intr_disable(host->intr);
+                    goto isr_exit;
+                }
+            }
 #endif  //#if CONFIG_IDF_TARGET_ESP32
+        }
+
+#if CONFIG_IDF_TARGET_ESP32
+        // Release the shared DMA channel before returning the descriptor. A
+        // completion callback may immediately reuse its buffers and queue the
+        // next transaction from another core.
+        if (use_dma) {
+            spicommon_dmaworkaround_idle(host->dma_ctx->tx_dma_chan.chan_id);
+            if (spicommon_dmaworkaround_reset_in_progress()) {
+                esp_intr_disable(host->intr);
+                goto isr_exit;
+            }
+        }
+#endif
 
         if (host->cfg.post_trans_cb) {
             host->cfg.post_trans_cb(host->cur_trans.trans);
@@ -700,22 +910,7 @@ static void SPI_SLAVE_ISR_ATTR spi_intr(void *arg)
         host->cur_trans.trans = NULL;
     }
 
-#if CONFIG_IDF_TARGET_ESP32
-    //This workaround is only for esp32
-    if (use_dma) {
-        //On ESP32, actual_tx_dma_chan and actual_rx_dma_chan are always same
-        spicommon_dmaworkaround_idle(host->dma_ctx->tx_dma_chan.chan_id);
-        if (spicommon_dmaworkaround_reset_in_progress()) {
-            //We need to wait for the reset to complete. Disable int (will be re-enabled on reset callback) and exit isr.
-            esp_intr_disable(host->intr);
-            if (do_yield) {
-                portYIELD_FROM_ISR();
-            }
-            return;
-        }
-    }
-#endif  //#if CONFIG_IDF_TARGET_ESP32
-
+dispatch_next:
     //Disable interrupt before checking to avoid concurrency issue.
     esp_intr_disable(host->intr);
     spi_slave_trans_priv_t priv_trans;
@@ -724,9 +919,6 @@ static void SPI_SLAVE_ISR_ATTR spi_intr(void *arg)
     if (r) {
         // sanity check
         assert(priv_trans.trans);
-
-        //enable the interrupt again if there is packet to send
-        esp_intr_enable(host->intr);
 
         //We have a transaction. Send it.
         host->cur_trans = priv_trans;
@@ -747,19 +939,23 @@ static void SPI_SLAVE_ISR_ATTR spi_intr(void *arg)
         spi_slave_hal_hw_reset(hal);
         s_spi_slave_prepare_data(host);
 
-        //The slave rx dma get disturbed by unexpected transaction. Only connect the CS and start DMA when slave is ready.
-        if (use_dma) {
-            restore_cs(host);
-        }
+        // The slave rx dma gets disturbed by unexpected transactions. Abort
+        // also leaves CS disconnected, so reconnect it only when the next
+        // transaction is ready.
+        restore_cs(host);
+
 #if CONFIG_SPIRAM && SOC_PSRAM_DMA_CAPABLE
         spi_slave_hal_clear_intr_status(hal, SPI_LL_INTR_IN_FULL | SPI_LL_INTR_OUT_EMPTY);
 #endif
         //Kick off transfer
+        esp_intr_enable(host->intr);
         spi_slave_hal_user_start(hal);
         if (host->cfg.post_setup_cb) {
             host->cfg.post_setup_cb(priv_trans.trans);
         }
     }
+isr_exit:
+    portEXIT_CRITICAL_ISR(&host->transaction_lock);
     if (do_yield) {
         portYIELD_FROM_ISR();
     }
